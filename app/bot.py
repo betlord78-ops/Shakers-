@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from html import escape
 
 from sqlalchemy import desc, select, update as sa_update
+from sqlalchemy.exc import IntegrityError
 from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -22,7 +23,7 @@ from .config import settings
 from .db import SessionLocal
 from .models import JoinRequest, Membership, PaymentOrder
 from .pricing import build_quote
-from .verifiers import VerificationError, verify_payment
+from .verifiers import VerificationError, _extract_tx_hash, verify_payment
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -178,7 +179,7 @@ async def create_payment_order(target_message, context: ContextTypes.DEFAULT_TYP
     with SessionLocal() as session:
         session.execute(
             sa_update(PaymentOrder)
-            .where(PaymentOrder.user_id == user_id, PaymentOrder.status == "pending")
+            .where(PaymentOrder.user_id == user_id, PaymentOrder.status.in_(["pending", "verifying"]))
             .values(status="expired", verification_notes="Superseded by new quote")
         )
         order = PaymentOrder(
@@ -240,13 +241,13 @@ async def send_status(user_id: int, target_message) -> None:
 
 
 async def tx_hash_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    tx_hash = (update.effective_message.text or "").strip()
+    raw_tx_hash = (update.effective_message.text or "").strip()
     user_id = update.effective_user.id
 
     with SessionLocal() as session:
         order = session.execute(
             select(PaymentOrder)
-            .where(PaymentOrder.user_id == user_id, PaymentOrder.status == "pending")
+            .where(PaymentOrder.user_id == user_id, PaymentOrder.status.in_(["pending", "verifying"]))
             .order_by(desc(PaymentOrder.created_at))
         ).scalar_one_or_none()
 
@@ -267,19 +268,59 @@ async def tx_hash_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             return
 
-        order.status = "verifying"
-        order.tx_hash = tx_hash
         order_id = order.id
         order_coin = order.coin
         order_wallet = order.destination_wallet
         order_amount = order.coin_amount
-        session.commit()
+
+    try:
+        normalized_tx_hash = _extract_tx_hash(raw_tx_hash, order_coin)
+    except VerificationError as exc:
+        await update.effective_message.reply_text(
+            f"Payment not verified yet.\n\nReason: {exc}",
+            reply_markup=payment_actions_keyboard(),
+            disable_web_page_preview=True,
+        )
+        return
 
     await update.effective_message.reply_text(
         "Checking your transaction now...",
         reply_markup=payment_actions_keyboard(),
         disable_web_page_preview=True,
     )
+
+    with SessionLocal() as session:
+        current = session.execute(select(PaymentOrder).where(PaymentOrder.id == order_id)).scalar_one_or_none()
+        if current is None:
+            await update.effective_message.reply_text(
+                "Order no longer exists. Choose a payment method again.",
+                reply_markup=payment_menu_keyboard(),
+            )
+            return
+
+        duplicate = session.execute(
+            select(PaymentOrder).where(PaymentOrder.tx_hash == normalized_tx_hash, PaymentOrder.id != order_id)
+        ).scalar_one_or_none()
+        if duplicate is not None:
+            await update.effective_message.reply_text(
+                "That transaction hash has already been used on another order. Send a different tx hash.",
+                reply_markup=payment_actions_keyboard(),
+            )
+            return
+
+        current.status = "verifying"
+        current.tx_hash = normalized_tx_hash
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            await update.effective_message.reply_text(
+                "That transaction hash has already been used. Send a different tx hash.",
+                reply_markup=payment_actions_keyboard(),
+            )
+            return
+
+    tx_hash = normalized_tx_hash
 
     try:
         result = await asyncio.wait_for(
@@ -410,6 +451,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if text.startswith("/"):
         return
+    logger.info('Received free-text message from user %s: %s', update.effective_user.id if update.effective_user else None, text[:200])
     await tx_hash_received(update, context)
 
 

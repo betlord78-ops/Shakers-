@@ -94,7 +94,7 @@ async def startup() -> None:
     await telegram_app.bot.set_webhook(
         url=webhook_url,
         secret_token=settings.telegram_webhook_secret,
-        allowed_updates=['message', 'callback_query', 'chat_join_request'],
+        allowed_updates=['message', 'edited_message', 'callback_query', 'chat_join_request'],
     )
     scheduler.add_job(process_auto_verifications, 'interval', minutes=1, max_instances=1, coalesce=True)
     scheduler.start()
