@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 from datetime import datetime, timedelta
@@ -268,34 +269,74 @@ async def tx_hash_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         order.status = "verifying"
         order.tx_hash = tx_hash
+        order_id = order.id
+        order_coin = order.coin
+        order_wallet = order.destination_wallet
+        order_amount = order.coin_amount
         session.commit()
 
-        try:
-            result = verify_payment(order.coin, tx_hash, order.destination_wallet, order.coin_amount)
-        except VerificationError as exc:
-            order.status = "pending"
-            order.verification_notes = str(exc)
-            session.commit()
+    await update.effective_message.reply_text(
+        "Checking your transaction now...",
+        reply_markup=payment_actions_keyboard(),
+        disable_web_page_preview=True,
+    )
+
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(verify_payment, order_coin, tx_hash, order_wallet, order_amount),
+            timeout=25,
+        )
+    except asyncio.TimeoutError:
+        with SessionLocal() as session:
+            current = session.execute(select(PaymentOrder).where(PaymentOrder.id == order_id)).scalar_one_or_none()
+            if current:
+                current.status = "pending"
+                current.verification_notes = "Verification timed out"
+                session.commit()
+        await update.effective_message.reply_text(
+            "Verification timed out. Please send the tx hash again in a moment.",
+            reply_markup=payment_actions_keyboard(),
+        )
+        return
+    except VerificationError as exc:
+        with SessionLocal() as session:
+            current = session.execute(select(PaymentOrder).where(PaymentOrder.id == order_id)).scalar_one_or_none()
+            if current:
+                current.status = "pending"
+                current.verification_notes = str(exc)
+                session.commit()
+        await update.effective_message.reply_text(
+            f"Payment not verified yet.\n\nReason: {exc}",
+            reply_markup=payment_actions_keyboard(),
+        )
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Unexpected verification error for user %s: %s", user_id, exc)
+        with SessionLocal() as session:
+            current = session.execute(select(PaymentOrder).where(PaymentOrder.id == order_id)).scalar_one_or_none()
+            if current:
+                current.status = "pending"
+                current.verification_notes = f"Unexpected verification error: {exc}"
+                session.commit()
+        await update.effective_message.reply_text(
+            "Unexpected verification error. Please try again in a moment.",
+            reply_markup=payment_actions_keyboard(),
+        )
+        return
+
+    with SessionLocal() as session:
+        current = session.execute(select(PaymentOrder).where(PaymentOrder.id == order_id)).scalar_one_or_none()
+        if current is None:
             await update.effective_message.reply_text(
-                f"Payment not verified yet.\n\nReason: {exc}",
-                reply_markup=payment_actions_keyboard(),
-            )
-            return
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Unexpected verification error for user %s: %s", user_id, exc)
-            order.status = "pending"
-            order.verification_notes = f"Unexpected verification error: {exc}"
-            session.commit()
-            await update.effective_message.reply_text(
-                "Unexpected verification error. Please try again in a moment.",
-                reply_markup=payment_actions_keyboard(),
+                "Order no longer exists. Choose a payment method again.",
+                reply_markup=payment_menu_keyboard(),
             )
             return
 
-        order.status = "paid"
-        order.paid_at = datetime.utcnow()
-        order.tx_sender = result.sender
-        order.verification_notes = result.notes
+        current.status = "paid"
+        current.paid_at = datetime.utcnow()
+        current.tx_sender = result.sender
+        current.verification_notes = result.notes
 
         membership = session.execute(
             select(Membership).where(Membership.user_id == user_id)
@@ -306,14 +347,14 @@ async def tx_hash_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 chat_id=settings.vip_chat_id,
                 access_type="lifetime",
                 active=True,
-                order_code=order.order_code,
+                order_code=current.order_code,
             )
             session.add(membership)
         else:
             membership.active = True
             membership.chat_id = settings.vip_chat_id
             membership.access_type = "lifetime"
-            membership.order_code = order.order_code
+            membership.order_code = current.order_code
 
         join_request = session.execute(
             select(JoinRequest).where(
