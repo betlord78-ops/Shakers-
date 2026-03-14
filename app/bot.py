@@ -46,7 +46,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton('Choose Payment Method', callback_data='menu:pay')],
-        [InlineKeyboardButton('Support', url=f'https://t.me/{settings.support_username.lstrip('@')}')],
+        [InlineKeyboardButton('Support', url=f"https://t.me/{settings.support_username.lstrip('@')}")],
     ])
     await update.effective_message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
