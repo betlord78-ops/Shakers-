@@ -30,8 +30,14 @@ BINANCE_SYMBOLS = {
     'BNB': 'BNBUSDT',
 }
 
+COINBASE_SYMBOLS = {
+    'SOL': 'SOL-USD',
+    'ETH': 'ETH-USD',
+    'BNB': 'BNB-USD',
+}
+
 _PRICE_CACHE: dict[str, tuple[float, float]] = {}
-_CACHE_TTL_SECONDS = 60
+_CACHE_TTL_SECONDS = 180
 
 
 async def _fetch_coingecko_price(coin: str) -> float:
@@ -60,6 +66,18 @@ async def _fetch_binance_price(coin: str) -> float:
         return float(data['price'])
 
 
+async def _fetch_coinbase_price(coin: str) -> float:
+    symbol = COINBASE_SYMBOLS[coin]
+    async with httpx.AsyncClient(timeout=15) as client:
+        response = await client.get(
+            f'https://api.coinbase.com/v2/prices/{symbol}/spot',
+            headers={'accept': 'application/json'},
+        )
+        response.raise_for_status()
+        data = response.json()
+        return float(data['data']['amount'])
+
+
 async def fetch_usd_price(coin: str) -> float:
     if coin == 'USDT_BEP20':
         return 1.0
@@ -70,9 +88,11 @@ async def fetch_usd_price(coin: str) -> float:
         return cached[1]
 
     last_error = None
-    for fetcher in (_fetch_coingecko_price, _fetch_binance_price):
+    for fetcher in (_fetch_binance_price, _fetch_coinbase_price, _fetch_coingecko_price):
         try:
             price = await fetcher(coin)
+            if price <= 0:
+                raise RuntimeError(f'Invalid non-positive price from {fetcher.__name__}')
             _PRICE_CACHE[coin] = (now, price)
             return price
         except Exception as exc:  # noqa: BLE001

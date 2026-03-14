@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
+from urllib.parse import urlparse
 
 from solders.signature import Signature
 from solana.rpc.api import Client as SolanaClient
@@ -13,6 +15,8 @@ from .config import settings
 BEP20_TRANSFER_TOPIC = Web3.keccak(text='Transfer(address,address,uint256)').hex()
 USDT_BEP20_DECIMALS = 18
 ZEROX = '0x000000000000000000000000'
+EVM_TX_RE = re.compile(r'0x[a-fA-F0-9]{64}')
+SOL_SIG_RE = re.compile(r'[1-9A-HJ-NP-Za-km-z]{43,100}')
 
 
 class VerificationError(Exception):
@@ -24,6 +28,34 @@ class VerificationResult:
     ok: bool
     sender: str | None = None
     notes: str | None = None
+
+
+def _extract_tx_hash(raw_value: str, coin: str) -> str:
+    value = raw_value.strip()
+    if value.startswith('http://') or value.startswith('https://'):
+        parsed = urlparse(value)
+        path = parsed.path.rstrip('/')
+        last_segment = path.split('/')[-1] if path else ''
+        value = last_segment or value
+
+    if coin in {'USDT_BEP20', 'BNB', 'ETH'}:
+        match = EVM_TX_RE.search(value)
+        if not match:
+            raise VerificationError('Please send a valid transaction hash or explorer link.')
+        return match.group(0)
+
+    if coin == 'SOL':
+        candidates = [value]
+        candidates.extend(SOL_SIG_RE.findall(value))
+        for candidate in candidates:
+            try:
+                Signature.from_string(candidate)
+                return candidate
+            except Exception:
+                continue
+        raise VerificationError('Please send the Solana tx signature or a Solscan link.')
+
+    return value
 
 
 class EVMVerifier:
@@ -38,6 +70,8 @@ class EVMVerifier:
             if receipt is None or receipt.status != 1:
                 raise VerificationError('Transaction not confirmed successfully yet.')
             return tx, receipt, current_block
+        except VerificationError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise VerificationError(f'Unable to read transaction: {exc}') from exc
 
@@ -131,16 +165,17 @@ class SolVerifier:
 
 def verify_payment(coin: str, tx_hash: str, destination_wallet: str, expected_amount: float) -> VerificationResult:
     coin = coin.upper()
+    normalized_tx_hash = _extract_tx_hash(tx_hash, coin)
     if coin == 'USDT_BEP20':
         verifier = EVMVerifier(settings.bsc_rpc_url)
-        return verifier.verify_bep20_usdt(tx_hash, destination_wallet, expected_amount, settings.bsc_confirmations)
+        return verifier.verify_bep20_usdt(normalized_tx_hash, destination_wallet, expected_amount, settings.bsc_confirmations)
     if coin == 'BNB':
         verifier = EVMVerifier(settings.bsc_rpc_url)
-        return verifier.verify_native(tx_hash, destination_wallet, expected_amount, settings.bsc_confirmations)
+        return verifier.verify_native(normalized_tx_hash, destination_wallet, expected_amount, settings.bsc_confirmations)
     if coin == 'ETH':
         verifier = EVMVerifier(settings.eth_rpc_url)
-        return verifier.verify_native(tx_hash, destination_wallet, expected_amount, settings.eth_confirmations)
+        return verifier.verify_native(normalized_tx_hash, destination_wallet, expected_amount, settings.eth_confirmations)
     if coin == 'SOL':
         verifier = SolVerifier(settings.sol_rpc_url)
-        return verifier.verify_sol(tx_hash, destination_wallet, expected_amount, settings.sol_confirmations)
+        return verifier.verify_sol(normalized_tx_hash, destination_wallet, expected_amount, settings.sol_confirmations)
     raise VerificationError(f'Unsupported coin {coin}')
