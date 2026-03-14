@@ -6,15 +6,13 @@ from datetime import datetime, timedelta
 from html import escape
 
 from sqlalchemy import desc, select
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     ChatJoinRequestHandler,
     CommandHandler,
     ContextTypes,
-    ConversationHandler,
     MessageHandler,
     filters,
 )
@@ -28,12 +26,18 @@ from .verifiers import VerificationError, verify_payment
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-WAITING_TX_HASH = 1
 COIN_LABELS = {
     'USDT_BEP20': 'USDT (BEP20)',
     'BNB': 'BNB (BSC)',
     'ETH': 'ETH (Ethereum)',
     'SOL': 'SOL (Solana)',
+}
+
+TEXT_TO_COIN = {
+    'USDT (BEP20)': 'USDT_BEP20',
+    'SOL': 'SOL',
+    'ETH': 'ETH',
+    'BNB': 'BNB',
 }
 
 
@@ -48,42 +52,68 @@ def _wallet_for_coin(coin: str) -> str:
 
 def _payment_text(coin: str, order_code: str, amount_text: str, wallet: str) -> str:
     return (
-        f"<b>{escape(settings.vip_chat_title)}</b>\n"
-        f"Access: <b>Lifetime</b>\n"
-        f"USD value: <b>${settings.lifetime_price_usd:.0f}</b>\n"
-        f"Payment method: <b>{escape(COIN_LABELS[coin])}</b>\n"
-        f"Amount to pay: <b>{escape(amount_text)}</b>\n"
-        f"Wallet: <code>{escape(wallet)}</code>\n"
-        f"Order ID: <code>{escape(order_code)}</code>\n"
-        f"Quote expires: <b>{settings.quote_expiry_minutes} minutes</b>\n\n"
-        "The bot will auto-check your payment in the background. "
-        "You can also tap <b>Submit Tx Hash</b> for instant manual verification."
+        f"<b>{escape(settings.vip_chat_title)}</b>
+"
+        f"Access: <b>Lifetime</b>
+"
+        f"USD value: <b>${settings.lifetime_price_usd:.0f}</b>
+"
+        f"Payment method: <b>{escape(COIN_LABELS[coin])}</b>
+"
+        f"Amount to pay: <b>{escape(amount_text)}</b>
+"
+        f"Wallet: <code>{escape(wallet)}</code>
+"
+        f"Order ID: <code>{escape(order_code)}</code>
+"
+        f"Quote expires: <b>{settings.quote_expiry_minutes} minutes</b>
+
+"
+        "After payment, send your tx hash here for instant verification.
+"
+        "The bot also keeps auto-checking your payment in the background."
     )
 
 
-def payment_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton('USDT (BEP20)', callback_data='coin:USDT_BEP20')],
-        [InlineKeyboardButton('SOL', callback_data='coin:SOL')],
-        [InlineKeyboardButton('ETH', callback_data='coin:ETH')],
-        [InlineKeyboardButton('BNB', callback_data='coin:BNB')],
-        [InlineKeyboardButton('My Access Status', callback_data='action:status')],
-    ])
+def payment_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ['USDT (BEP20)'],
+            ['SOL', 'ETH'],
+            ['BNB'],
+            ['My Access Status'],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
+def payment_actions_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            ['Refresh Price', 'My Access Status'],
+            ['Choose Payment Method'],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        f"Welcome to <b>{escape(settings.vip_chat_title)}</b>\n\n"
-        "This bot handles lifetime VIP access payments.\n"
-        f"Price: <b>${settings.lifetime_price_usd:.0f}</b>\n"
-        "Access: <b>Lifetime</b>\n\n"
-        "Tap the button below to choose your payment method after you submit your Telegram join request."
+        f"Welcome to <b>{escape(settings.vip_chat_title)}</b>
+
+"
+        "This bot handles lifetime VIP access payments.
+"
+        f"Price: <b>${settings.lifetime_price_usd:.0f}</b>
+"
+        "Access: <b>Lifetime</b>
+
+"
+        "Submit your join request, then choose a payment method below."
     )
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton('Choose Payment Method', callback_data='menu:pay')],
-        [InlineKeyboardButton('Support', url=f"https://t.me/{settings.support_username.lstrip('@')}")],
-    ])
-    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=payment_menu_keyboard())
 
 
 async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -112,7 +142,9 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         session.commit()
 
     text = (
-        f"Your join request for <b>{escape(settings.vip_chat_title)}</b> is pending.\n\n"
+        f"Your join request for <b>{escape(settings.vip_chat_title)}</b> is pending.
+
+"
         f"To unlock <b>lifetime access</b>, pay <b>${settings.lifetime_price_usd:.0f}</b> using one of the supported coins below."
     )
     try:
@@ -126,86 +158,88 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         logger.warning('Failed to DM user %s after join request: %s', jr.from_user.id, exc)
 
 
-async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if query is None:
-        return ConversationHandler.END
-    await query.answer()
-    data = query.data or ''
+async def create_payment_order(target_message, context: ContextTypes.DEFAULT_TYPE, user_id: int, coin: str) -> None:
+    wallet = _wallet_for_coin(coin).strip()
+    if not wallet:
+        await target_message.reply_text(
+            f'{COIN_LABELS.get(coin, coin)} is not configured yet. Add the wallet in Railway variables and try again.',
+            reply_markup=payment_menu_keyboard(),
+        )
+        return
 
     try:
-        if data == 'menu:pay':
-            await query.message.reply_text('Choose your payment method:', reply_markup=payment_menu_keyboard())
-            return ConversationHandler.END
-
-        if data.startswith('coin:'):
-            coin = data.split(':', 1)[1]
-            wallet = _wallet_for_coin(coin).strip()
-            if not wallet:
-                await query.message.reply_text(
-                    f'{COIN_LABELS.get(coin, coin)} is not configured yet. Add the wallet in Railway variables and try again.'
-                )
-                return ConversationHandler.END
-
-            try:
-                quote = await build_quote(coin)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception('Quote build failed for %s: %s', coin, exc)
-                if coin == 'USDT_BEP20':
-                    await query.message.reply_text('USDT is fixed at $80, but the payment wallet is unavailable right now. Check your bot variables.')
-                else:
-                    await query.message.reply_text('Unable to fetch a live quote right now. Please try again in a minute.')
-                return ConversationHandler.END
-
-            order_code = secrets.token_hex(4).upper()
-            expires_at = datetime.utcnow() + timedelta(minutes=settings.quote_expiry_minutes)
-            with SessionLocal() as session:
-                session.execute(
-                    PaymentOrder.__table__.update()
-                    .where(PaymentOrder.user_id == query.from_user.id, PaymentOrder.status == 'pending')
-                    .values(status='expired', verification_notes='Superseded by new quote')
-                )
-                order = PaymentOrder(
-                    user_id=query.from_user.id,
-                    order_code=order_code,
-                    coin=coin,
-                    usd_amount=quote.usd_amount,
-                    coin_amount=quote.coin_amount,
-                    destination_wallet=quote.destination_wallet,
-                    expires_at=expires_at,
-                    status='pending',
-                )
-                session.add(order)
-                session.commit()
-
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton('Submit Tx Hash', callback_data='action:submit_tx')],
-                [InlineKeyboardButton('Refresh Price', callback_data=f'coin:{coin}')],
-                [InlineKeyboardButton('Choose Another Coin', callback_data='menu:pay')],
-                [InlineKeyboardButton('Check Payment Now', callback_data='action:status')],
-            ])
-            await query.message.reply_text(
-                _payment_text(coin, order_code, quote.display_amount, quote.destination_wallet),
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb,
-                disable_web_page_preview=True,
-            )
-            return ConversationHandler.END
-
-        if data == 'action:submit_tx':
-            await query.message.reply_text('Send your transaction hash for verification.')
-            return WAITING_TX_HASH
-
-        if data == 'action:status':
-            await send_status(query.from_user.id, query.message)
-            return ConversationHandler.END
-
+        quote = await build_quote(coin)
     except Exception as exc:  # noqa: BLE001
-        logger.exception('Callback handling failed for data=%s user=%s: %s', data, getattr(query.from_user, 'id', None), exc)
-        await query.message.reply_text('Something went wrong while opening that payment option. Please try again in a few seconds.')
-        return ConversationHandler.END
+        logger.exception('Quote build failed for %s: %s', coin, exc)
+        if coin == 'USDT_BEP20':
+            await target_message.reply_text(
+                'USDT is fixed at $80, but the payment wallet is unavailable right now. Check your bot variables.',
+                reply_markup=payment_menu_keyboard(),
+            )
+        else:
+            await target_message.reply_text(
+                'Unable to fetch a live quote right now. Please try again in a minute.',
+                reply_markup=payment_menu_keyboard(),
+            )
+        return
 
-    return ConversationHandler.END
+    order_code = secrets.token_hex(4).upper()
+    expires_at = datetime.utcnow() + timedelta(minutes=settings.quote_expiry_minutes)
+    with SessionLocal() as session:
+        session.execute(
+            PaymentOrder.__table__.update()
+            .where(PaymentOrder.user_id == user_id, PaymentOrder.status == 'pending')
+            .values(status='expired', verification_notes='Superseded by new quote')
+        )
+        order = PaymentOrder(
+            user_id=user_id,
+            order_code=order_code,
+            coin=coin,
+            usd_amount=quote.usd_amount,
+            coin_amount=quote.coin_amount,
+            destination_wallet=quote.destination_wallet,
+            expires_at=expires_at,
+            status='pending',
+        )
+        session.add(order)
+        session.commit()
+
+    context.user_data['last_coin'] = coin
+    context.user_data['awaiting_tx_hash'] = True
+    await target_message.reply_text(
+        _payment_text(coin, order_code, quote.display_amount, quote.destination_wallet),
+        parse_mode=ParseMode.HTML,
+        reply_markup=payment_actions_keyboard(),
+        disable_web_page_preview=True,
+    )
+
+
+async def send_status(user_id: int, target_message) -> None:
+    with SessionLocal() as session:
+        membership = session.execute(select(Membership).where(Membership.user_id == user_id, Membership.active.is_(True))).scalar_one_or_none()
+        order = session.execute(
+            select(PaymentOrder).where(PaymentOrder.user_id == user_id).order_by(desc(PaymentOrder.created_at))
+        ).scalar_one_or_none()
+
+    if membership:
+        await target_message.reply_text(f'Access status: ACTIVE
+Group: {settings.vip_chat_title}
+Type: Lifetime', reply_markup=payment_actions_keyboard())
+        return
+
+    if order is None:
+        await target_message.reply_text('No payment order found yet. Choose a payment method to begin.', reply_markup=payment_menu_keyboard())
+        return
+
+    await target_message.reply_text(
+        f'Latest order: {order.order_code}
+Coin: {COIN_LABELS.get(order.coin, order.coin)}
+Status: {order.status.upper()}
+Amount: {order.coin_amount}
+
+If you already paid, send the tx hash here. The bot is also checking automatically.',
+        reply_markup=payment_actions_keyboard(),
+    )
 
 
 async def tx_hash_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -220,15 +254,15 @@ async def tx_hash_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ).scalar_one_or_none()
 
         if order is None:
-            await update.effective_message.reply_text('No active payment order found. Tap /start and create a new payment quote.')
-            return ConversationHandler.END
+            await update.effective_message.reply_text('No active payment order found. Choose a payment method first.', reply_markup=payment_menu_keyboard())
+            return None
 
         if order.expires_at < datetime.utcnow():
             order.status = 'expired'
             order.verification_notes = 'Order expired before tx submission'
             session.commit()
-            await update.effective_message.reply_text('That quote has expired. Tap /start and generate a fresh quote.')
-            return ConversationHandler.END
+            await update.effective_message.reply_text('That quote has expired. Tap Refresh Price or choose a coin again.', reply_markup=payment_actions_keyboard())
+            return None
 
         order.status = 'verifying'
         order.tx_hash = tx_hash
@@ -240,15 +274,17 @@ async def tx_hash_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
             order.status = 'pending'
             order.verification_notes = str(exc)
             session.commit()
-            await update.effective_message.reply_text(f'Payment not verified yet.\n\nReason: {exc}')
-            return ConversationHandler.END
+            await update.effective_message.reply_text(f'Payment not verified yet.
+
+Reason: {exc}', reply_markup=payment_actions_keyboard())
+            return None
         except Exception as exc:  # noqa: BLE001
             logger.exception('Unexpected verification error for user %s: %s', user_id, exc)
             order.status = 'pending'
             order.verification_notes = f'Unexpected verification error: {exc}'
             session.commit()
-            await update.effective_message.reply_text('Unexpected verification error. Please try again in a moment.')
-            return ConversationHandler.END
+            await update.effective_message.reply_text('Unexpected verification error. Please try again in a moment.', reply_markup=payment_actions_keyboard())
+            return None
 
         order.status = 'paid'
         order.paid_at = datetime.utcnow()
@@ -277,35 +313,42 @@ async def tx_hash_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.approve_chat_join_request(chat_id=settings.vip_chat_id, user_id=user_id)
         approved_msg = (
-            f'Payment confirmed.\n\nYour access to {settings.vip_chat_title} has been activated and your join request has been approved.'
+            f'Payment confirmed.
+
+Your access to {settings.vip_chat_title} has been activated and your join request has been approved.'
         )
-        await update.effective_message.reply_text(approved_msg)
+        await update.effective_message.reply_text(approved_msg, reply_markup=ReplyKeyboardRemove())
     except Exception as exc:  # noqa: BLE001
         logger.exception('Verified but failed to approve join request: %s', exc)
         await update.effective_message.reply_text(
-            'Payment verified successfully, but I could not approve the join request automatically. Please contact support immediately.'
+            'Payment verified successfully, but I could not approve the join request automatically. Please contact support immediately.',
+            reply_markup=payment_actions_keyboard(),
         )
-    return ConversationHandler.END
+    return None
 
 
-async def send_status(user_id: int, target_message) -> None:
-    with SessionLocal() as session:
-        membership = session.execute(select(Membership).where(Membership.user_id == user_id, Membership.active.is_(True))).scalar_one_or_none()
-        order = session.execute(
-            select(PaymentOrder).where(PaymentOrder.user_id == user_id).order_by(desc(PaymentOrder.created_at))
-        ).scalar_one_or_none()
-
-    if membership:
-        await target_message.reply_text(f'Access status: ACTIVE\nGroup: {settings.vip_chat_title}\nType: Lifetime')
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (update.effective_message.text or '').strip()
+    if text in TEXT_TO_COIN:
+        await create_payment_order(update.effective_message, context, update.effective_user.id, TEXT_TO_COIN[text])
         return
-
-    if order is None:
-        await target_message.reply_text('No payment order found yet. Tap /start to begin.')
+    if text == 'Choose Payment Method':
+        context.user_data['awaiting_tx_hash'] = False
+        await update.effective_message.reply_text('Choose your payment method:', reply_markup=payment_menu_keyboard())
         return
-
-    await target_message.reply_text(
-        f'Latest order: {order.order_code}\nCoin: {COIN_LABELS.get(order.coin, order.coin)}\nStatus: {order.status.upper()}\nAmount: {order.coin_amount}\n\nIf you already paid, the bot is still checking automatically. You can also submit the tx hash manually.'
-    )
+    if text == 'Refresh Price':
+        coin = context.user_data.get('last_coin')
+        if not coin:
+            await update.effective_message.reply_text('Choose a payment method first.', reply_markup=payment_menu_keyboard())
+            return
+        await create_payment_order(update.effective_message, context, update.effective_user.id, coin)
+        return
+    if text == 'My Access Status':
+        await send_status(update.effective_user.id, update.effective_message)
+        return
+    if text.startswith('/'):
+        return
+    await tx_hash_received(update, context)
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -326,12 +369,8 @@ async def admin_paid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     lines = ['Latest paid orders:']
     for o in orders:
         lines.append(f'- {o.order_code} | user {o.user_id} | {o.coin} {o.coin_amount} | {o.paid_at}')
-    await update.effective_message.reply_text('\n'.join(lines))
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text('Cancelled.')
-    return ConversationHandler.END
+    await update.effective_message.reply_text('
+'.join(lines))
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -340,19 +379,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def build_application() -> Application:
     application = Application.builder().token(settings.telegram_bot_token).updater(None).build()
-    conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(menu_handler, pattern=r'^(menu:pay|coin:.*|action:submit_tx|action:status)$')],
-        states={
-            WAITING_TX_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, tx_hash_received)],
-        },
-        fallbacks=[CommandHandler('cancel', cancel)],
-        per_chat=True,
-        per_user=True,
-    )
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('status', status_command))
     application.add_handler(CommandHandler('paid_orders', admin_paid))
     application.add_handler(ChatJoinRequestHandler(on_join_request))
-    application.add_handler(conv)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     application.add_error_handler(error_handler)
     return application
